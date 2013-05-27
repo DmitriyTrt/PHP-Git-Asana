@@ -1,0 +1,299 @@
+#!/usr/bin/env php
+<?php
+
+$config = array(
+  // Asana API key.
+  'asana_key' => '',
+
+  // List of enabled branches.
+  'branches' => array('master'),
+
+  'log' => array(
+    // Absolute path to log file. Must be writable by git user. Leave empty to
+    // disable.
+    'path' => '',
+
+    // Whether to log info messages. When FALSE, only errors will be logged.
+    'info' => FALSE,
+  ),
+);
+
+function process_post_receive() {
+  log_info('Post-receive hook processing started...');
+
+  $in = fopen('php://stdin', 'rb');
+
+  while ($line = fgets($in)) {
+    $line = trim($line);
+    $line = explode(' ', $line);
+    if (count($line) !== 3) {
+      continue;
+    }
+
+    list($old_commit_id, $new_commit_id, $ref) = $line;
+
+    try {
+      // Make sure we operate on enabled branches only.
+      $branch = parse_branch_name_from_ref($ref);
+      if (!is_enabled_on_branch($branch)) {
+        continue;
+      }
+
+      // Get the list of commit IDs from the range and process them.
+      $commit_ids = git_get_commits_from_range($old_commit_id, $new_commit_id);
+      foreach ($commit_ids as $commit_id) {
+        $commit_info = git_get_commit_info($commit_id);
+        $references = parse_commit_references($commit_info['message']);
+        foreach ($references as $task_id => $close) {
+          asana_post_task_comment($task_id, $commit_info);
+          log_info("Posted comment to task #$task_id");
+
+          if ($close) {
+            asana_close_cask($task_id);
+            log_info("Closed #$task_id");
+          }
+        }
+      }
+    }
+    catch (Exception $e) {
+      // Just log error and continue to the next line.
+      log_error($e->getMessage());
+    }
+  }
+
+  fclose($in);
+
+  log_info('Post-receive hook processing finished.');
+}
+
+function parse_commit_references($message) {
+  $references = array();
+
+  if (preg_match_all('/(?:\b(fixes|closes)\b\s*)?\#(\d+)/iu', $message, $matches_set, PREG_SET_ORDER)) {
+    foreach ($matches_set as $matches) {
+      list(, $action, $task_id) = $matches;
+
+      if (!isset($references[$task_id])) {
+        $references[$task_id] = !empty($action);
+      }
+      elseif (!empty($action)) {
+        // When task is referenced multiple times and this one with the closing
+        // keyword, overwite, so we don't miss this flag.
+        $references[$task_id] = TRUE;
+      }
+    }
+  }
+
+  return $references;
+}
+
+function execute_shell_command($command) {
+  exec($command, $output, $exit_code);
+  if (!empty($exit_code)) {
+    // Non-zero exit code means failure.
+    throw new Exception("Exit code $exit_code from command: $command");
+  }
+
+  return $output;
+}
+
+function git_get_commits_from_range($old_commit_id, $new_commit_id) {
+  $command = 'git rev-list --reverse ' . escapeshellarg($old_commit_id . '..' . $new_commit_id);
+  $commit_ids = execute_shell_command($command);
+
+  $commit_ids = array_filter($commit_ids);
+  if (empty($commit_ids)) {
+    throw new Exception("Empty commits list between $old_commit_id and $new_commit_id");
+  }
+
+  return $commit_ids;
+}
+
+function git_get_commit_info($commit_id) {
+  $command = "git rev-list --max-count=1 --format=format:'%an%n%B' " . escapeshellarg($commit_id);
+  $output = execute_shell_command($command);
+  if (count($output) < 3) {
+    throw new Exception("Unexpected commit data: $output");
+  }
+
+  // Git command returns:
+  // commit [hash]
+  // [author name]
+  // [full
+  //  commit
+  //  message]
+  $info = array(
+    'author' => $output[1],
+    'message' => trim(implode("\n", array_slice($output, 2))),
+  );
+  return $info;
+}
+
+function is_enabled_on_branch($branch) {
+  global $config;
+  return in_array($branch, $config['branches'], TRUE);
+}
+
+function parse_branch_name_from_ref($ref) {
+  $command = 'git rev-parse --symbolic --abbrev-ref ' . escapeshellarg($ref);
+  $output = execute_shell_command($command);
+  if (count($output) !== 1) {
+    throw new Exception('Unable to parse ref: ' . $ref);
+  }
+
+  return reset($output);
+}
+
+function asana_request($path, $type, array $data) {
+  global $config;
+
+  if (empty($config['asana_key'])) {
+    throw new Exception('Asana key is not defined or empty.');
+  }
+
+  $url = 'https://app.asana.com/api/1.0/' . ltrim($path, '/');
+
+  $ch = curl_init();
+  curl_setopt($ch, CURLOPT_HTTPAUTH, CURLAUTH_BASIC);
+  curl_setopt($ch, CURLOPT_USERPWD, $config['asana_key'] . ':');
+
+  curl_setopt($ch, CURLOPT_HEADER, FALSE);
+  curl_setopt($ch, CURLOPT_RETURNTRANSFER, TRUE);
+
+  $memory_file = NULL;
+  switch (strtoupper($type)) {
+    case 'GET':
+      $url .= '?' . http_build_query($data, NULL, '&');
+      curl_setopt($ch, CURLOPT_URL, $url);
+      break;
+
+    case 'POST':
+      $data_encoded = array();
+      foreach ($data as $key => $value) {
+        $data_encoded[] = $key . '=' . rawurlencode($value);
+      }
+      $data_encoded = implode('&', $data_encoded);
+
+      curl_setopt($ch, CURLOPT_URL, $url);
+      curl_setopt($ch, CURLOPT_POST, TRUE);
+      curl_setopt($ch, CURLOPT_POSTFIELDS, $data_encoded);
+      curl_setopt($ch, CURLOPT_HTTPHEADER, array(
+        'Content-Type' => 'application/x-www-form-urlencoded',
+      ));
+      break;
+
+    case 'PUT':
+      $data_encoded = json_encode(array(
+        'data' => $data,
+      ));
+
+      // We have to use trick with in-memory file.
+      $memory_file = fopen('php://memory', 'rwb');
+      if (!$memory_file) {
+        throw new Exception("Unable to create in-memory file for request: $url");
+      }
+      fputs($memory_file, $data_encoded);
+      fseek($memory_file, 0);
+
+      curl_setopt($ch, CURLOPT_URL, $url);
+      curl_setopt($ch, CURLOPT_PUT, TRUE);
+      curl_setopt($ch, CURLOPT_INFILE, $memory_file);
+      curl_setopt($ch, CURLOPT_INFILESIZE, strlen($data_encoded));
+      curl_setopt($ch, CURLOPT_HTTPHEADER, array(
+        'Content-Type' => 'application/json',
+      ));
+      break;
+
+    default:
+      throw new Exception("$type is unknown type of the request. URL: $url");
+  }
+
+  // Execute request.
+  $result = curl_exec($ch);
+
+  // Close memory file if any.
+  if ($memory_file) {
+    fclose($memory_file);
+  }
+
+  if ($result === FALSE) {
+    $error = curl_error($ch);
+    curl_close($ch);
+    throw new Exception("cURL request falied. URL: $url\nDetails: $error");
+  }
+
+  $status = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+  if (!in_array($status, array(200, 201))) {
+    curl_close($ch);
+    throw new Exception("Asana request failed. URL: $url\nHTTP Code: $status\nResponse: $result");
+  }
+
+  curl_close($ch);
+  return $result;
+}
+
+function asana_close_cask($task_id) {
+  asana_request('tasks/' . $task_id, 'PUT', array(
+    'completed' => 'true',
+  ));
+}
+
+function asana_post_task_comment($task_id, $commit_info) {
+  $path = 'tasks/' . rawurlencode($task_id) . '/stories';
+  $data = array(
+    'text' => '--By ' . $commit_info['author'] . "\n" . $commit_info['message'],
+  );
+  asana_request($path, 'POST', $data);
+}
+
+function log_open() {
+  global $config;
+
+  $log = FALSE;
+  if (!empty($config['log']['path'])) {
+    $log = @fopen($config['log']['path'], 'ab');
+  }
+  return $log;
+}
+
+function log_info($message) {
+  global $config;
+
+  if (!empty($config['log']['info'])) {
+    $log = log_open();
+    if ($log) {
+      fputs($log, $message . "\n");
+      fclose($log);
+    }
+  }
+}
+
+function log_error($message) {
+  $log = log_open();
+  if ($log) {
+    fputs($log, "-- At " . date('c') . "\n");
+    fputs($log, $message . "\n");
+    fclose($log);
+  }
+}
+
+/**
+ * Debug function to log stdin to a file.
+ */
+function log_std_input() {
+  $log = log_open();
+  if (!$log) {
+    return;
+  }
+
+  $in = fopen('php://stdin', 'rb');
+  while ($line = fgets($in)) {
+    fputs($log, $line);
+  }
+  fclose($in);
+
+  fclose($log);
+}
+
+error_reporting(0);
+process_post_receive();
