@@ -1,5 +1,12 @@
 #!/usr/bin/env php
 <?php
+/**
+ * Post-receive hook for Git & Asana integration
+ * 
+ * Licensed under GPL v3: http://www.gnu.org/licenses/gpl-3.0.txt
+ * 
+ * Project homepage: https://github.com/DmitriyTrt/PHP-Git-Asana
+ */
 
 $config = array(
   // Asana API key.

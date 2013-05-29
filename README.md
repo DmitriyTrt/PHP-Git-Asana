@@ -16,3 +16,6 @@ Post-receive hook for Git & Asana integration
 
 ## Credits
 Developed for [USEUM.org](http://useum.org/)
+
+## License
+[GPL v3](http://www.gnu.org/licenses/gpl-3.0.txt)
